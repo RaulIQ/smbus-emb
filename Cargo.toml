@@ -27,11 +27,32 @@ embassy-stm32 = { path = "../my-embassy/embassy-stm32", features = [
 embassy-time = { path = "../my-embassy/embassy-time", features = [
     "tick-hz-32_768",
 ] }
+
+embassy-sync = { path = "../my-embassy/embassy-sync" }
+
 panic-halt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 
 [[bin]]
 name = "smbus-emb"
+test = false
+bench = false
+
+[[bin]]
+name = "slave_smbus"
+path = "src/bin/slave_smbus.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "smbus"
+path = "src/bin/smbus.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "master_smbus"
+path = "src/bin/master_smbus.rs"
 test = false
 bench = false
 
