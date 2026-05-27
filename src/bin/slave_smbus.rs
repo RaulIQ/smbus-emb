@@ -3,8 +3,8 @@
 //! # Wiring (STM32F103 Blue Pill)
 //!
 //! ```text
-//!   PB6 ── SCL ── autopilot I2C
-//!   PB7 ── SDA
+//!   PB10 ── SCL ── autopilot I2C
+//!   PB11 ── SDA
 //!   4.7k pull-ups on SCL/SDA
 //! ```
 //!
@@ -25,6 +25,7 @@ use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::i2c::{
     self, Config as I2cConfig, I2c, SlaveAddrConfig, SlaveCommandKind, Smbus, SmbusConfig,
+    SmbusRole,
 };
 use embassy_stm32::time::Hertz;
 use embassy_time::{Duration, Timer};
@@ -33,23 +34,32 @@ use panic_probe as _;
 /// 7-bit SMBus battery address (ArduPilot default).
 const SLAVE_ADDR: u8 = 0x0B;
 
-/// Block payload for register 0x20 (manufacturer name).
-const MANUFACTURER_NAME: &[u8] = b"Stub";
+// Keep values aligned with the ESP32-C3 stub you provided.
+const TEXT_MANUFACTURER: &str = "ESP32-C3";
+const TEXT_DEVICE_NAME: &str = "SmartBat-Stub";
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
 
-    info!("SMBus slave stub @ 0x{:02X} on I2C1 (PB6/PB7)", SLAVE_ADDR);
+    info!(
+        "SMBus slave stub @ 0x{:02X} on I2C2 (PB10/PB11)",
+        SLAVE_ADDR
+    );
 
     let mut i2c_cfg = I2cConfig::default();
     i2c_cfg.frequency = Hertz(100_000);
 
-    let i2c_slave = I2c::new_blocking(p.I2C1, p.PB6, p.PB7, i2c_cfg)
-        .into_slave_multimaster(SlaveAddrConfig::basic(SLAVE_ADDR));
-    let smbus_slave = Smbus::new(i2c_slave, SmbusConfig::default());
+    // IMPORTANT (STM32F1 / I2C v1): apply SMBus mode BEFORE configuring slave addressing.
+    // Applying SMBus config toggles CR1.PE, which can otherwise interfere with slave address match.
+    let i2c = I2c::new_blocking(p.I2C2, p.PB10, p.PB11, i2c_cfg);
+    let mut smbus_cfg = SmbusConfig::default();
+    smbus_cfg.role = SmbusRole::Device;
+    let i2c = Smbus::new(i2c, smbus_cfg).into_i2c();
 
-    spawner.spawn(smbus_slave_task(smbus_slave).unwrap());
+    let i2c_slave = i2c.into_slave_multimaster(SlaveAddrConfig::basic(SLAVE_ADDR));
+
+    spawner.spawn(i2c_slave_task(i2c_slave).unwrap());
 
     let led = Output::new(p.PC13, Level::High, Speed::Low);
     spawner.spawn(blinker(led).unwrap());
@@ -70,12 +80,11 @@ async fn blinker(mut led: Output<'static>) {
 }
 
 #[embassy_executor::task]
-async fn smbus_slave_task(
-    mut slave: Smbus<'static, embassy_stm32::mode::Blocking, i2c::mode::MultiMaster>,
+async fn i2c_slave_task(
+    mut slave: I2c<'static, embassy_stm32::mode::Blocking, i2c::mode::MultiMaster>,
 ) {
-    let mut last_reg = 0u8;
-    // After a block length byte, the next read returns length + data.
-    let mut block_data_pending = false;
+    let mut pending_cmd: u8 = 0;
+    let mut cmd_valid = false;
 
     loop {
         match slave.blocking_listen() {
@@ -84,19 +93,22 @@ async fn smbus_slave_task(
                     let mut buf = [0u8; 4];
                     match slave.blocking_respond_to_write(&mut buf) {
                         Ok(n) if n > 0 => {
-                            last_reg = buf[0];
-                            block_data_pending = false;
-                            info!("reg write: 0x{:02X}", last_reg);
+                            pending_cmd = buf[0];
+                            cmd_valid = true;
+                            info!("RX cmd=0x{:02X}", pending_cmd);
                         }
                         Ok(_) => {}
                         Err(e) => error!("write: {}", i2c_err(e)),
                     }
                 }
                 SlaveCommandKind::Read => {
-                    let mut payload = [0u8; 32];
-                    let len = fill_read_payload(last_reg, &mut block_data_pending, &mut payload);
+                    let cmd = if cmd_valid { pending_cmd } else { 0x00 };
+                    cmd_valid = false;
+
+                    let mut payload = [0u8; 36];
+                    let len = smbus_battery_fill_response(cmd, &mut payload);
                     match slave.blocking_respond_to_read(&payload[..len]) {
-                        Ok(n) => info!("reg 0x{:02X} read: {} bytes", last_reg, n),
+                        Ok(n) => info!("TX cmd=0x{:02X} len={}", cmd, n),
                         Err(e) => error!("read: {}", i2c_err(e)),
                     }
                 }
@@ -109,48 +121,57 @@ async fn smbus_slave_task(
     }
 }
 
-/// Fill `out` with the SMBus read response; returns payload length.
-fn fill_read_payload(reg: u8, block_data_pending: &mut bool, out: &mut [u8]) -> usize {
-    if is_block_register(reg) {
-        if *block_data_pending {
-            *block_data_pending = false;
-            let n = MANUFACTURER_NAME.len();
-            out[0] = n as u8;
-            out[1..=n].copy_from_slice(MANUFACTURER_NAME);
-            n + 1
-        } else {
-            *block_data_pending = true;
-            out[0] = MANUFACTURER_NAME.len() as u8;
-            1
-        }
-    } else {
-        *block_data_pending = false;
-        let v = register_word(reg);
-        out[0] = v as u8;
-        out[1] = (v >> 8) as u8;
-        2
+fn append_word(out: &mut [u8], value: u16) -> usize {
+    if out.len() < 2 {
+        return 0;
     }
+    out[0] = (value & 0xFF) as u8;
+    out[1] = (value >> 8) as u8;
+    2
 }
 
-fn is_block_register(reg: u8) -> bool {
-    matches!(reg, 0x20 | 0x23)
+fn append_block(out: &mut [u8], text: &str) -> usize {
+    let bytes = text.as_bytes();
+    if bytes.len() > 31 || out.len() < 1 + bytes.len() {
+        return 0;
+    }
+    out[0] = bytes.len() as u8;
+    out[1..1 + bytes.len()].copy_from_slice(bytes);
+    1 + bytes.len()
 }
 
-/// Smart Battery word values (little-endian on the wire).
-fn register_word(reg: u8) -> u16 {
-    match reg {
-        // ArduPilot BATTMONITOR_SMBUS_* registers
-        0x08 => 2981,   // temperature, 0.1 K → ~25 °C
-        0x09 => 12_600, // voltage, mV → 12.6 V
-        0x0A => 0,      // current, mA (signed)
-        0x0F => 2_500,  // remaining capacity, mAh
-        0x10 => 5_000,  // full charge capacity, mAh
-        0x17 => 42,     // cycle count
-        0x1A => 0x0010, // specification info: version 1 → no PEC
-        0x1C => 0x1234, // serial number
-        // Per-cell voltages (optional, mV)
-        0x3f | 0x3e | 0x3d | 0x3c => 4_200,
-        _ => 0,
+/// Build SMBus read response for `cmd` into `out`.
+/// Word: LSB first. Block: [length][payload...].
+/// Unknown command: returns a single 0x00 byte.
+fn smbus_battery_fill_response(cmd: u8, out: &mut [u8]) -> usize {
+    match cmd {
+        // Smart Battery Specification 1.1 command codes (as in ESP32-C3 stub)
+        0x03 => append_word(out, 0x0000), // ManufacturerAccess()
+        0x08 => append_word(out, 2982),   // Temperature() 25.0°C in 0.1K
+        0x09 => append_word(out, 12_600), // Voltage() mV
+        0x0A => append_word(out, 0),      // Current() mA (signed)
+        0x0D => append_word(out, 75),     // RelativeStateOfCharge() %
+        0x0F => append_word(out, 3000),   // RemainingCapacity() mAh
+        0x10 => append_word(out, 4000),   // FullChargeCapacity() mAh
+        0x16 => append_word(out, 0x0000), // BatteryStatus() OK
+        0x18 => append_word(out, 4000),   // DesignCapacity()
+        0x19 => append_word(out, 12_600), // DesignVoltage()
+        0x1C => append_word(out, 0x0001), // SerialNumber()
+
+        // Some stacks use 0x1D/0x1E, Smart Battery spec uses 0x20/0x21.
+        0x1D | 0x20 => append_block(out, TEXT_MANUFACTURER),
+        0x1E | 0x21 => append_block(out, TEXT_DEVICE_NAME),
+
+        // Cell voltages (ArduPilot SMBus_Generic probes these, mV).
+        0x34 | 0x35 | 0x36 | 0x37 | 0x38 | 0x39 | 0x3A | 0x3B | 0x3C | 0x3D | 0x3E | 0x3F => {
+            append_word(out, 4200)
+        }
+
+        _ => {
+            // ArduPilot reads most registers as a "word" (2 bytes). Returning 2 bytes here
+            // avoids edge-cases where the master keeps clocking and we run into timeouts.
+            append_word(out, 0x0000)
+        }
     }
 }
 
