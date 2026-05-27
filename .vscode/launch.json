@@ -1,0 +1,50 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "name": "Debug STM32F103",
+            "chip": "STM32F103C8",
+            "coreConfigs": [
+                {
+                    "programBinary": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/master_smbus"
+                }
+            ],
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "haltAfterReset": true
+            }
+        },
+        {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "Cortex-Debug slave_smbus (registers)",
+            "servertype": "openocd",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/slave_smbus",
+            "device": "STM32F103C8",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f1x.cfg"
+            ],
+            "svdFile": "${workspaceFolder}/STM32F103.svd",
+            "runToEntryPoint": "main"
+        },
+        {
+            "type": "cortex-debug",
+            "request": "launch",
+            "name": "Cortex-Debug master_smbus (registers)",
+            "servertype": "openocd",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/target/thumbv7m-none-eabi/debug/master_smbus",
+            "device": "STM32F103C8",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f1x.cfg"
+            ],
+            "svdFile": "${workspaceFolder}/STM32F103.svd",
+            "runToEntryPoint": "main"
+        }
+    ]
+}
